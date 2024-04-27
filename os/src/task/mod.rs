@@ -14,8 +14,12 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
 use crate::sync::UPSafeCell;
+use crate::syscall::TaskInfo;
+use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -153,6 +157,76 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// Update current 'Running' task's system call times
+    fn update_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+
+    /// Get current 'Running' task's ppn by giving vpn
+    fn get_ppn_by_vpn(&self, vpn: VirtPageNum) -> Option<PhysPageNum> {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.translate(vpn.into()).map(|entry| entry.ppn())
+    }
+
+    /// Get current 'Running' task's info
+    fn get_task_info(&self, ti: *mut TaskInfo) {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        unsafe {
+            (*ti).status = inner.tasks[cur].task_status;
+            (*ti).syscall_times = inner.tasks[cur].syscall_times;
+            (*ti).time = get_time_ms() - inner.tasks[cur].start_time;
+        }
+    }
+
+    /// Map memory from current 'Running' task memory set
+    fn map_task_memory(&self, start_va: VirtAddr, end_va: VirtAddr, port: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let vpn_range = VPNRange::new(
+            VirtPageNum::from(start_va),
+            end_va.ceil()
+        );
+
+        for vpn in vpn_range {
+            if let Some(pte) = inner.tasks[cur].memory_set.translate(vpn) {
+                if pte.is_valid() {
+                    error!("MMAP: {:?} point to an valid page", vpn);
+                    return -1;
+                }
+            }
+        }
+
+        let perm = MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
+        inner.tasks[cur].memory_set.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    /// Unmap memory from current 'Running' task memory set
+    fn unmap_task_memory(&self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let vpn_range = VPNRange::new(
+            VirtPageNum::from(start_va),
+            end_va.ceil(),
+        );
+
+        for vpn in vpn_range {
+            if let Some(pte) = inner.tasks[cur].memory_set.translate(vpn) {
+                if !pte.is_valid() {
+                    error!("MUNMAP: {:?} point to an invalid page", vpn);
+                    return -1
+                }
+            }
+        }
+
+        inner.tasks[cur].memory_set.remove_framed_area(vpn_range);
+        0
+    }
 }
 
 /// Run the first task in task list.
@@ -201,4 +275,49 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Update current 'Running' task's system call times
+pub fn update_syscall_times(syscall_id: usize) {
+    if syscall_id >= MAX_SYSCALL_NUM {
+        return;
+    }
+    TASK_MANAGER.update_syscall_times(syscall_id);
+}
+
+/// Get current 'Running' task's ppn by giving vpn
+pub fn ppn_by_vpn(vpn: VirtPageNum) -> Option<PhysPageNum> {
+    TASK_MANAGER.get_ppn_by_vpn(vpn)
+}
+
+/// Get current 'Running' task's info
+pub fn get_task_info(ti: *mut TaskInfo) {
+    TASK_MANAGER.get_task_info(ti);
+}
+
+/// Map memory from current 'Running' task memory set
+pub fn task_mmap(start: usize, len: usize, port: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+    if !start_va.aligned() {
+        error!("Expect the start address to be aligned by page size, but {:#x}", start);
+        return -1;
+    }
+    if port > 0b1000 || port == 0 {
+        error!("Invalid mmap permission flag: {:#b}", port);
+        return -1;
+    }
+    let end_va = VirtAddr::from(start + len);
+    TASK_MANAGER.map_task_memory(start_va, end_va, port)
+}
+
+/// Unmap memory from current 'Running' task memory set
+pub fn task_munmap(start: usize, len: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+    if !start_va.aligned() {
+        error!("Expect the start address to be aligned by page size, but {:#x}", start);
+        return -1;
+    }
+    
+    let end_va = VirtAddr::from(start + len);
+    TASK_MANAGER.unmap_task_memory(start_va, end_va)
 }
