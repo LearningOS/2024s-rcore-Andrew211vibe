@@ -7,6 +7,8 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
+use crate::config::MAX_SYSCALL_NUM;
+use crate::mm::{MapPermission, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
@@ -44,6 +46,69 @@ impl Processor {
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
     }
+
+    /// Get current task's ppn by giving vpn
+    pub fn get_ppn_by_vpn(&self, vpn: VirtPageNum) -> Option<PhysPageNum> {
+        let current = self.current().unwrap();
+        let ppn = current
+            .inner_exclusive_access()
+            .memory_set
+            .translate(vpn.into())
+            .map(|entry| entry.ppn());
+        ppn
+    }
+
+    /// Update current 'Running' task's system call times
+    pub fn update_syscall_times(&self, syscall_id: usize) {
+        let current = self.current().unwrap();
+        let mut inner = current.inner_exclusive_access();
+        inner.syscall_times[syscall_id] += 1;
+    }
+
+    /// Map memory from current 'Running' task's memory set
+    pub fn map_task_memory(&self, start_va: VirtAddr, end_va: VirtAddr, port: usize) -> isize {
+        let current = self.current().unwrap();
+        let mut inner = current.inner_exclusive_access();
+        let vpn_range = VPNRange::new(
+            VirtPageNum::from(start_va), 
+            end_va.ceil(),
+        );
+
+        for vpn in vpn_range {
+            if let Some(pte) = inner.memory_set.translate(vpn) {
+                if pte.is_valid() {
+                    error!("[kernel] MMAP: {:?} point to an valid page", vpn);
+                    return -1;
+                }
+            }
+        }
+
+        let perm = MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
+        inner.memory_set.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    /// Unmap memory from current 'Running' task's memory set
+    pub fn unmap_task_memory(&self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let current = self.current().unwrap();
+        let mut inner = current.inner_exclusive_access();
+        let vpn_range = VPNRange::new(
+            VirtPageNum::from(start_va), 
+            end_va.ceil(),
+        );
+
+        for vpn in vpn_range {
+            if let Some(pte) = inner.memory_set.translate(vpn) {
+                if !pte.is_valid() {
+                    error!("[kernel] UNMMAP: {:?} point to an valid page", vpn);
+                    return -1;
+                }
+            }
+        }
+
+        inner.memory_set.remove_area_with_start_vpn(vpn_range.get_start());
+        0
+    }
 }
 
 lazy_static! {
@@ -61,6 +126,7 @@ pub fn run_tasks() {
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
+            task_inner.update_stride();
             // release coming task_inner manually
             drop(task_inner);
             // release coming task TCB manually
@@ -108,4 +174,44 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }
+}
+
+/// Get current task's ppn by giving vpn
+pub fn ppn_by_vpn(vpn: VirtPageNum) -> Option<PhysPageNum> {
+    PROCESSOR.exclusive_access().get_ppn_by_vpn(vpn)
+}
+
+/// Update current 'Running' task's system call times
+pub fn update_syscall_times(syscall_id: usize) {
+    if syscall_id >= MAX_SYSCALL_NUM {
+        return;
+    }
+    PROCESSOR.exclusive_access().update_syscall_times(syscall_id);
+}
+
+/// Map memory from current 'Running' task's memory set
+pub fn task_mmap(start: usize, len: usize, port: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+    if !start_va.aligned() {
+        error!("Expect the start address to be aligned by page size, but {:#x}", start);
+        return -1
+    }
+    if port > 0b1000 || port == 0 {
+        error!("Invalid mmap permission flag: {:#b}", port);
+        return -1
+    }
+    let end_va = VirtAddr::from(start + len);
+    PROCESSOR.exclusive_access().map_task_memory(start_va, end_va, port)
+}
+
+/// Unmap memory from current 'Running' task's memory set
+pub fn task_munmap(start: usize, len: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+    if !start_va.aligned() {
+        error!("Expect the start address to be aligned by page size, but {:#x}", start);
+        return -1
+    }
+    
+    let end_va = VirtAddr::from(start + len);
+    PROCESSOR.exclusive_access().unmap_task_memory(start_va, end_va)
 }
