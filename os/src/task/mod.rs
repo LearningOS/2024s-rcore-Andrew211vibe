@@ -14,14 +14,16 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::MAX_APP_NUM;
+use crate::config::{MAX_APP_NUM, MAX_SYSCALL_NUM};
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+use crate::syscall::TaskInfo;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -54,6 +56,8 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            start_time: get_time_ms(),
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -135,6 +139,24 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// Update current `Running` task's system call times
+    fn update_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+
+    /// Get current `Running` task's info
+    fn get_task_info(&self, ti: *mut TaskInfo) {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        unsafe {
+            (*ti).status = inner.tasks[cur].task_status;
+            (*ti).syscall_times = inner.tasks[cur].syscall_times;
+            (*ti).time = get_time_ms() - inner.tasks[cur].start_time;
+        }
+    }
 }
 
 /// Run the first task in task list.
@@ -168,4 +190,17 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Update the current `Running` task's system call times
+pub fn update_syscall_times(syscall_id: usize) {
+    if syscall_id >= MAX_SYSCALL_NUM {
+        return;
+    }
+    TASK_MANAGER.update_syscall_times(syscall_id);
+}
+
+/// Get current `Running` task's info
+pub fn get_task_info(ti: *mut TaskInfo) {
+    TASK_MANAGER.get_task_info(ti);
 }
