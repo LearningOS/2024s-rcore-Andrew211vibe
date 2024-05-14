@@ -1,7 +1,9 @@
 //! Process management syscalls
+use core::mem::size_of;
+
 use crate::{
-    config::MAX_SYSCALL_NUM, mm::{PhysAddr, VirtAddr}, task::{
-        change_program_brk, exit_current_and_run_next, get_task_info, ppn_by_vpn, suspend_current_and_run_next, task_mmap, task_munmap, TaskStatus
+    config::MAX_SYSCALL_NUM, mm::{translated_byte_buffer, PhysAddr, VirtAddr}, task::{
+        change_program_brk, current_user_token, exit_current_and_run_next, get_task_info, ppn_by_vpn, suspend_current_and_run_next, task_mmap, task_munmap, TaskStatus
     }, timer::get_time_us
 };
 
@@ -23,7 +25,7 @@ pub struct TaskInfo {
     pub time: usize,
 }
 
-fn va_to_pa(va: VirtAddr) -> Option<PhysAddr> {
+fn _va_to_pa(va: VirtAddr) -> Option<PhysAddr> {
     let offset = va.page_offset();
     let ppn = ppn_by_vpn(va.floor());
     match ppn {
@@ -54,22 +56,35 @@ pub fn sys_yield() -> isize {
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
-    let ts = va_to_pa(VirtAddr::from(_ts as usize));
-    if let Some(pa) = ts {
-        let us = get_time_us();
-        let ts = pa.0 as *mut TimeVal;
+    // let ts = va_to_pa(VirtAddr::from(_ts as usize));
+    // if let Some(pa) = ts {
+    //     let us = get_time_us();
+    //     let ts = pa.0 as *mut TimeVal;
+    //     unsafe {
+    //         *ts = TimeVal {
+    //             sec: us / 1_000_000,
+    //             usec: us % 1_000_000,
+    //         };
+    //     }
+    //     0
+    // } else {
+    //     error!("sys_get_time() failed");
+    //     -1
+    // }
+    let buffers = translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>());
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let mut time_val_ptr = &time_val as *const _ as *const u8;
+    for buffer in buffers {
         unsafe {
-            *ts = TimeVal {
-                sec: us / 1_000_000,
-                usec: us % 1_000_000,
-            };
+            time_val_ptr.copy_to(buffer.as_mut_ptr(), buffer.len());
+            time_val_ptr = time_val_ptr.add(buffer.len());
         }
-        0
-    } else {
-        error!("sys_get_time() failed");
-        -1
     }
-    
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
@@ -80,14 +95,21 @@ pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
     if _ti.is_null() {
         return -1
     }
-    let ti = va_to_pa(VirtAddr::from(_ti as usize));
-    if let Some(pa) = ti {
-        let ti = pa.0 as *mut TaskInfo;
-        get_task_info(ti);
-        0
-    } else {
-        -1
-    }
+    // let ti = va_to_pa(VirtAddr::from(_ti as usize));
+    // if let Some(pa) = ti {
+    //     let ti = pa.0 as *mut TaskInfo;
+    //     get_task_info(ti);
+    //     0
+    // } else {
+    //     -1
+    // }
+    let ti = translated_byte_buffer(
+        current_user_token(), 
+        _ti as *const u8, 
+        size_of::<TaskInfo>()
+    )[0].as_ptr() as *mut TaskInfo;
+    get_task_info(ti);
+    0
 }
 
 // YOUR JOB: Implement mmap.
