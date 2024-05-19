@@ -43,7 +43,7 @@ pub struct TaskControlBlockInner {
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
     /// whether thread need resource, false for mutex, true for semaphone
-    pub need: Option<(bool, usize)>,
+    pub resource: Option<(bool, usize)>,
     /// resource allocated to thread
     pub allocation: Vec<(bool, usize)>,
 }
@@ -60,7 +60,7 @@ impl TaskControlBlockInner {
 
     /// take needed resource
     pub fn require_resource(&mut self) {
-        self.allocation.push(self.need.take().unwrap());
+        self.allocation.push(self.resource.take().unwrap());
     }
 }
 
@@ -86,7 +86,7 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Ready,
                     exit_code: None,
                     allocation: Vec::new(),
-                    need: None,
+                    resource: None,
                 })
             },
         }
